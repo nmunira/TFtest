@@ -45,5 +45,5 @@ jobs:
           ARM_SUBSCRIPTION_ID: ${{ vars.TEST_TF_SUBSCRIPTION_ID }}
           ARM_CLIENT_SECRET: ${{ secrets.TESTTF_VALUE_CLIENTSECRET }}
       if: github.ref == 'refs/heads/main'
-      run: terraform destroy -auto-approve tfplan
+      run: terraform destroy -auto-approve 
       working-directory: ./terraform
