@@ -1,4 +1,4 @@
-name: Deploy Terraform to Azure
+name: Deploy Appservice
 
 on:
   push:
@@ -25,14 +25,29 @@ jobs:
         creds: ${{ secrets.AZURE_CREDENTIALS }}
         
     - name: 'Terraform Init'
+    env:
+          ARM_CLIENT_ID: ${{ secrets.TEST_TF_CLIENTID }}
+          ARM_TENANT_ID: ${{ secrets.TEST_TF_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ vars.TEST_TF_SUBSCRIPTION_ID }}
+          ARM_CLIENT_SECRET: ${{ secrets.TESTTF_VALUE_CLIENTSECRET }}
       run: terraform init
       working-directory: ./terraform  # Adjust if your Terraform files are in a different directory
 
     - name: 'Terraform Plan'
+    env:
+          ARM_CLIENT_ID: ${{ secrets.TEST_TF_CLIENTID }}
+          ARM_TENANT_ID: ${{ secrets.TEST_TF_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ vars.TEST_TF_SUBSCRIPTION_ID }}
+          ARM_CLIENT_SECRET: ${{ secrets.TESTTF_VALUE_CLIENTSECRET }}
       run: terraform plan -out=tfplan
       working-directory: ./terraform
 
     - name: 'Terraform Apply'
+    env:
+          ARM_CLIENT_ID: ${{ secrets.TEST_TF_CLIENTID }}
+          ARM_TENANT_ID: ${{ secrets.TEST_TF_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ vars.TEST_TF_SUBSCRIPTION_ID }}
+          ARM_CLIENT_SECRET: ${{ secrets.TESTTF_VALUE_CLIENTSECRET }}
       if: github.ref == 'refs/heads/main'
       run: terraform apply -auto-approve tfplan
       working-directory: ./terraform
