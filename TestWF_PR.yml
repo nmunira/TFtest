@@ -1,0 +1,1237 @@
+name: "Integrate in TMP"
+
+on:
+  pull_request:
+    branches: [ main ]
+    paths-ignore:
+      - '**.md'
+
+env:
+  STACK_SUFFIX: tmp${{github.event.number}}
+  COVERAGE_DIR: tmp${{github.event.number}}
+  COVERAGE_MOUNT: /mnt/coverage
+  MONGO_DBNAME: tdrive-tmp${{github.event.number}}
+  STORAGE_CONTAINER_NAME: tdrive-tmp${{github.event.number}}
+  AZURE_FUNCTION_APP_PACKAGE_PATH: 'src/functions/azure/UploadFunctionApp'
+  IMAGE_TAG: 'hello-world@sha256:7e9b6e7ba2842c91cf49f3e214d04a7a496f8214356f41d81a6e6dcad11f11e3'
+  FRONT_DOOR_NAME: afd-dcaz-tdrvd
+  API_CONTAINER_NAME: ca-dcaz-tdrvd-api-$STACK_SUFFIX
+  API_TAM_CONTAINER_NAME: ca-dcaz-tdrvd-api-tam-$STACK_SUFFIX
+  VWORKER_CONTAINER_NAME: ca-dcaz-tdrvd-vworker-$STACK_SUFFIX
+  COMMIT_CONTAINER_NAME: ca-dcaz-tdrvd-commit-$STACK_SUFFIX
+  COMMIT_TAM_CONTAINER_NAME: ca-dcaz-tdrvd-commit-tam-$STACK_SUFFIX
+  STATS_CONTAINER_NAME: ca-dcaz-tdrvd-stats-$STACK_SUFFIX
+  SPACE_EVENTS_PROCESSOR_CONTAINER_NAME: ca-dcaz-tdrvd-eventspace-$STACK_SUFFIX
+  RESOURCE_EVENTS_PROCESSOR_CONTAINER_NAME: ca-dcaz-tdrvd-eventres-$STACK_SUFFIX
+  DELETE_WORKER_CONTAINER_NAME: ca-dcaz-tdrvd-delworker-$STACK_SUFFIX
+
+# Cancel in-progress runs of the same workflow for the same branch, we are interested in checking only the latest commit.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tam-registration:
+    permissions:
+      id-token: write
+      contents: read
+    environment: east_us_2_development
+    runs-on: ubuntu-latest
+    steps:
+        - uses: actions/checkout@v4
+
+        - name: Check for tam-policies folder changes
+          id: tamhaschanges
+          env:
+           GH_TOKEN: ${{ github.token }}
+          run: |
+            git fetch origin ${{ github.base_ref }} --depth=1
+            git diff --name-only FETCH_HEAD
+            if git diff --name-only FETCH_HEAD | grep -q "tam-policies/trimble.cde.drive.files";then
+              echo "There is a changes in Rego file for tam-policies/trimble.cde.drive.files folder proceeding further action"
+              tamHasChanges="true"
+            else
+              echo "No Changes in Rego file for tam-policies/trimble.cde.drive.files folder. Skipping further action."
+
+              tamHasChanges="false"
+            fi
+            echo "tamHasChanges=$(echo $tamHasChanges)" >> $GITHUB_OUTPUT
+
+        - name: Login to Azure
+          if: steps.tamhaschanges.outputs.tamHasChanges == 'true'
+          uses: azure/login@v1
+          with:
+            client-id: ${{ secrets.AZURE_CLIENT_ID }}
+            tenant-id: ${{ vars.AZURE_TENANT_ID }}
+            subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+        - uses: ./.github/actions/tam-registeration
+          if: steps.tamhaschanges.outputs.tamHasChanges == 'true'
+          id: tam-registeration
+          with:
+            TAM_CLIENT_ID: ${{ secrets.TAM_CLIENT_ID }}
+            TAM_CLIENT_SECRET: ${{ secrets.TAM_CLIENT_SECRET }}
+            tamServiceUrl: ${{ vars.TAM_SERVICE_URL }}
+            tamEnv: ${{ vars.TAM_CLIENT_APP_NAME }}
+            tidUrl: ${{ vars.TID_URL}}
+            env: "dev"
+            rgName: ${{ vars.AZURE_RG_NAME }}
+
+  detect-infrachanges:
+    permissions:
+      id-token: write
+      contents: read
+    environment: east_us_2_development
+    outputs:
+      infraHasChanges: ${{ steps.version-comparison.outputs.tagHasChanges }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - id: version-comparison
+        uses: ./.github/actions/compare-rg-tag
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          azure-rg-name: ${{ vars.AZURE_RG_NAME }}
+          version_filepath: 'iac/bicep/version.parameter.json'
+          rg_tag_to_compare: 'version-${{ env.STACK_SUFFIX }}'
+
+  init-containerappjob:
+    permissions:
+      id-token: write
+      contents: read
+    environment: east_us_2_development
+    runs-on: ubuntu-latest
+    outputs:
+      mongorunnername: ${{ steps.mongorunner.outputs.mongorunnername }}
+    needs:
+      - provision-infra
+    steps:
+      - name: Login to Azure
+        uses: azure/login@v1
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: 'Create Container App Job'
+        id: mongorunner
+        shell: bash
+        run: |
+          JOBNAME='ca-dcaz-tdrvd-ghrunner-${{ env.STACK_SUFFIX }}'
+          echo $JOBNAME
+          az containerapp job start --name $JOBNAME --resource-group ${{ vars.AZURE_RG_NAME }} --only-show-errors
+          mongorunnername='acajob-tmp'
+          echo "mongorunnername=$(echo $mongorunnername)" >> $GITHUB_OUTPUT
+
+  provision-mongodb:
+    environment: east_us_2_development
+    # Mongo private endpoint will be reachable only from the runners in RG via peering.
+    runs-on: ${{ needs.init-containerappjob.outputs.mongorunnername }}
+    # Dependends on provision-infra where app container job is created
+    needs:
+      - provision-infra
+      - init-containerappjob
+    outputs:
+      MONGO_DBNAME: ${{ env.MONGO_DBNAME }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 🍃 Install mongosh
+        shell: bash
+        run: |
+          apt-get update
+          apt-get install -y wget gnupg
+          wget -qO - https://www.mongodb.org/static/pgp/server-6.0.asc |  apt-key add -
+          echo "deb [ arch=amd64,arm64 ] https://repo.mongodb.org/apt/ubuntu jammy/mongodb-org/6.0 multiverse" |  tee /etc/apt/sources.list.d/mongodb-org-6.0.list
+          apt-get update
+          apt-get install -y mongodb-mongosh
+
+      - name: Setup Database
+        shell: bash
+        run: |
+          mongo_db_uri=$(echo "${{ secrets.MONGO_URI_ADMIN }}" | sed "s/\//\/${{ env.MONGO_DBNAME }}/3")
+          mongo_secret= ${{ secrets.MONGODB_BACKUP_API_BASIC_AUTH }}
+          mongo_snapshot_required="false"
+          source scripts/db-version-compare/db-versioncompare.sh
+          db_version_comparision $mongo_db_uri $mongo_secret $mongo_snapshot_required | tee mongo_execution.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Mongo_Execution_log
+          path: "mongo_execution.txt"
+          retention-days: 1
+
+  provision-kafka:
+    environment: east_us_2_development
+    runs-on: ubuntu-latest
+    env:
+      COMMIT_PROCESSOR_TOPIC: dev.dcaz.drive.commit-processor-tmp${{github.event.number}}.v1
+      DB_LATEST_KAFKA_TOPIC: dev.dcaz.drive.db.tdrive-tmp${{github.event.number}}.latest.v1
+      DB_LATEST_KAFKA_DLT: dev.dcaz.drive.db.tdrive-tmp${{github.event.number}}.latest.dlt.v1
+      DB_VERSIONS_KAFKA_TOPIC: dev.dcaz.drive.db.tdrive-tmp${{github.event.number}}.versions.v1
+      DB_VERSIONS_KAFKA_DLT: dev.dcaz.drive.db.tdrive-tmp${{github.event.number}}.versions.dlt.v1
+      DB_FILESPACE_KAFKA_TOPIC: dev.dcaz.drive.db.tdrive-tmp${{github.event.number}}.filespace.v1
+      DB_FILESPACE_KAFKA_DLT: dev.dcaz.drive.db.tdrive-tmp${{github.event.number}}.filespace.dlt.v1
+      DB_JOBS_KAFKA_TOPIC: dev.dcaz.drive.db.tdrive-tmp${{github.event.number}}.jobs.v1
+      SPACE_EVENTS_RESULT_TOPIC: dev.dcaz.drive.events-tmp${{github.event.number}}.space.v1
+      RESOURCE_EVENTS_RESULT_TOPIC: dev.dcaz.drive.events-tmp${{github.event.number}}.resource.v1
+    steps:
+      - name: Create Kafka topics
+        shell: bash
+        run: |
+          echo "Creating topic: ${{ env.COMMIT_PROCESSOR_TOPIC }}"
+          curl \
+            -X POST \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Basic ${{ secrets.CONFLUENT_KAFKA_BASIC_AUTH }}" \
+            ${{ vars.CONFLUENT_KAFKA_URL }}/kafka/v3/clusters/${{ vars.CONFLUENT_KAFKA_CLUSTER_ID }}/topics \
+            -d '{"topic_name":"${{ env.COMMIT_PROCESSOR_TOPIC }}","partitions_count":1}'
+
+          echo "Creating topic: ${{ env.DB_LATEST_KAFKA_TOPIC }}"
+          curl \
+            -X POST \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Basic ${{ secrets.CONFLUENT_KAFKA_BASIC_AUTH }}" \
+            ${{ vars.CONFLUENT_KAFKA_URL }}/kafka/v3/clusters/${{ vars.CONFLUENT_KAFKA_CLUSTER_ID }}/topics \
+            -d '{"topic_name":"${{ env.DB_LATEST_KAFKA_TOPIC }}","partitions_count":1}'
+
+          echo "Creating topic: ${{ env.DB_LATEST_KAFKA_DLT }}"
+          curl \
+            -X POST \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Basic ${{ secrets.CONFLUENT_KAFKA_BASIC_AUTH }}" \
+            ${{ vars.CONFLUENT_KAFKA_URL }}/kafka/v3/clusters/${{ vars.CONFLUENT_KAFKA_CLUSTER_ID }}/topics \
+            -d '{"topic_name":"${{ env.DB_LATEST_KAFKA_DLT }}","partitions_count":1}'
+
+          echo "Creating topic: ${{ env.DB_VERSIONS_KAFKA_TOPIC }}"
+          curl \
+            -X POST \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Basic ${{ secrets.CONFLUENT_KAFKA_BASIC_AUTH }}" \
+            ${{ vars.CONFLUENT_KAFKA_URL }}/kafka/v3/clusters/${{ vars.CONFLUENT_KAFKA_CLUSTER_ID }}/topics \
+            -d '{"topic_name":"${{ env.DB_VERSIONS_KAFKA_TOPIC }}","partitions_count":1}'
+          echo "Creating topic: ${{ env.DB_VERSIONS_KAFKA_DLT }}"
+          curl \
+            -X POST \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Basic ${{ secrets.CONFLUENT_KAFKA_BASIC_AUTH }}" \
+            ${{ vars.CONFLUENT_KAFKA_URL }}/kafka/v3/clusters/${{ vars.CONFLUENT_KAFKA_CLUSTER_ID }}/topics \
+            -d '{"topic_name":"${{ env.DB_VERSIONS_KAFKA_DLT }}","partitions_count":1}'
+          echo "Creating topic: ${{ env.DB_FILESPACE_KAFKA_TOPIC }}"
+          curl \
+            -X POST \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Basic ${{ secrets.CONFLUENT_KAFKA_BASIC_AUTH }}" \
+            ${{ vars.CONFLUENT_KAFKA_URL }}/kafka/v3/clusters/${{ vars.CONFLUENT_KAFKA_CLUSTER_ID }}/topics \
+            -d '{"topic_name":"${{ env.DB_FILESPACE_KAFKA_TOPIC }}","partitions_count":1}'
+          echo "Creating topic: ${{ env.DB_FILESPACE_KAFKA_DLT }}"
+          curl \
+            -X POST \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Basic ${{ secrets.CONFLUENT_KAFKA_BASIC_AUTH }}" \
+            ${{ vars.CONFLUENT_KAFKA_URL }}/kafka/v3/clusters/${{ vars.CONFLUENT_KAFKA_CLUSTER_ID }}/topics \
+            -d '{"topic_name":"${{ env.DB_FILESPACE_KAFKA_DLT }}","partitions_count":1}'
+          echo "Creating topic: ${{ env.DB_JOBS_KAFKA_TOPIC }}"
+          curl \
+            -X POST \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Basic ${{ secrets.CONFLUENT_KAFKA_BASIC_AUTH }}" \
+            ${{ vars.CONFLUENT_KAFKA_URL }}/kafka/v3/clusters/${{ vars.CONFLUENT_KAFKA_CLUSTER_ID }}/topics \
+            -d '{"topic_name":"${{ env.DB_JOBS_KAFKA_TOPIC }}","partitions_count":1}'
+
+          echo "Creating topic: ${{ env.SPACE_EVENTS_RESULT_TOPIC }}"
+          curl \
+            -X POST \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Basic ${{ secrets.CONFLUENT_KAFKA_BASIC_AUTH }}" \
+            ${{ vars.CONFLUENT_KAFKA_URL }}/kafka/v3/clusters/${{ vars.CONFLUENT_KAFKA_CLUSTER_ID }}/topics \
+            -d '{"topic_name":"${{ env.SPACE_EVENTS_RESULT_TOPIC }}","partitions_count":1}'
+
+
+          echo "Creating topic: ${{ env.RESOURCE_EVENTS_RESULT_TOPIC }}"
+          curl \
+            -X POST \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Basic ${{ secrets.CONFLUENT_KAFKA_BASIC_AUTH }}" \
+            ${{ vars.CONFLUENT_KAFKA_URL }}/kafka/v3/clusters/${{ vars.CONFLUENT_KAFKA_CLUSTER_ID }}/topics \
+            -d '{"topic_name":"${{ env.RESOURCE_EVENTS_RESULT_TOPIC }}","partitions_count":1}'
+
+  provision-infra:
+    permissions:
+      id-token: write
+      contents: read
+    environment: east_us_2_development
+    runs-on: ubuntu-latest
+    needs:
+      - detect-infrachanges
+    outputs:
+      FUNCTION_APP_NAME: ${{ steps.deploy.outputs.functionAppName || steps.funcapp.outputs.functionAppName }}
+      STORAGE_CONTAINER_NAME: ${{ env.STORAGE_CONTAINER_NAME }}
+      api_fqdn: ${{ steps.deploy.outputs.fqdn || steps.frontdoor.outputs.serviceurl }}
+      STORAGE_ACCOUNT_NAME: ${{ steps.deploy.outputs.storageAccountName }}
+      STORAGE_SYSTEM_TOPIC_NAME: ${{ steps.deploy.outputs.storageSystemTopicName }}
+      DIAG_STORAGE_ACCOUNT_NAME: ${{ steps.deploy.outputs.diagStorageAccountName || steps.diagstorage.outputs.diagStorageAccountName }}
+      API_CONTAINER_NAME: ${{ steps.deploy.outputs.apiContainerName || env.API_CONTAINER_NAME }}
+      API_TAM_CONTAINER_NAME: ${{ steps.deploy.outputs.apiTamSidecarContainerName || env.API_TAM_CONTAINER_NAME }}
+      VWORKER_CONTAINER_NAME: ${{ steps.deploy.outputs.vworkerContainerName || env.VWORKER_CONTAINER_NAME }}
+      COMMIT_CONTAINER_NAME: ${{ steps.deploy.outputs.commitContainerName || env.COMMIT_CONTAINER_NAME }}
+      COMMIT_TAM_CONTAINER_NAME: ${{ steps.deploy.outputs.commitTamSidecarContainerName || env.COMMIT_TAM_CONTAINER_NAME }}
+      STATS_CONTAINER_NAME: ${{ steps.deploy.outputs.statsContainerName || env.STATS_CONTAINER_NAME}}
+      SPACE_EVENTS_PROCESSOR_CONTAINER_NAME: ${{ steps.deploy.outputs.spaceEventsProcessorContainerName || env.SPACE_EVENTS_PROCESSOR_CONTAINER_NAME }}
+      RESOURCE_EVENTS_PROCESSOR_CONTAINER_NAME: ${{ steps.deploy.outputs.resourceEventsProcessorContainerName || env.RESOURCE_EVENTS_PROCESSOR_CONTAINER_NAME }}
+      DELETE_WORKER_CONTAINER_NAME: ${{ steps.deploy.outputs.deleteWorkerContainerName || env.DELETE_WORKER_CONTAINER_NAME }}
+      FILE_ACTIVATOR_BLOB_CONTAINER_NAME: ${{ steps.deploy.outputs.fileActivatorBlobContainerName }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Login to Azure
+        uses: azure/login@v1
+        with:
+          client-id: ${{ secrets.AZURE_INFRA_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: 'Detect infra changes'
+        run: |
+          az deployment group what-if --mode incremental --resource-group ${{ vars.AZURE_RG_NAME }} --name ${{ env.STACK_SUFFIX }}-${{github.run_number}}-${{github.run_attempt}}     --no-prompt     --template-file ./iac/bicep/main.bicep     --parameters ./iac/bicep/frontdoorbackendips.parameters.json apiServiceImageTag="${{ env.IMAGE_TAG }}" versionWorkerImageTag="${{ env.IMAGE_TAG }}" commitProcessorImageTag="${{ env.IMAGE_TAG }}" eventsProcessorImageTag="${{ env.IMAGE_TAG }}" statsProcessorImageTag="${{ env.IMAGE_TAG }}" deleteWorkerImageTag="${{ env.IMAGE_TAG }}" stackSuffix=${{ env.STACK_SUFFIX }} --exclude-change-types Ignore NoChange | tee whatifoutput.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Iac-What-if-Output
+          path: "whatifoutput.txt"
+          retention-days: 7
+
+      - name: deploy IaC
+        if: needs.detect-infrachanges.outputs.infraHasChanges == 'true'
+        id: deploy
+        uses: azure/arm-deploy@v1
+        with:
+          scope: resourcegroup
+          subscriptionId: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          resourceGroupName: ${{ vars.AZURE_RG_NAME }}
+          template: ./iac/bicep/main.bicep
+          parameters: './iac/bicep/frontdoorbackendips.parameters.json stackSuffix="${{ env.STACK_SUFFIX }}" apiServiceImageTag="${{ env.IMAGE_TAG }}" versionWorkerImageTag="${{ env.IMAGE_TAG }}" commitProcessorImageTag="${{ env.IMAGE_TAG }}" statsProcessorImageTag="${{ env.IMAGE_TAG}}" eventsProcessorImageTag="${{ env.IMAGE_TAG }}" deleteWorkerImageTag="${{ env.IMAGE_TAG }}" githubRunnerPat="${{ secrets.GIT_SELF_RUNNER_PAT_TOKEN }}"'
+          failOnStdErr: false
+          deploymentName: ${{ env.STACK_SUFFIX }}-${{github.run_number}}-${{github.run_attempt}}
+
+          # Below bash block is used to update the resource group tag with deployed version of infra (version-STACK_SUFFIX=XX) post IAC deployment
+      - shell: bash
+        if: needs.detect-infrachanges.outputs.infraHasChanges == 'true'
+        run: |
+          updateTagValue=$(jq -r '.VERSION' iac/bicep/version.parameter.json)
+          az group update --name ${{ vars.AZURE_RG_NAME }} --set tags.'version-'${{ env.STACK_SUFFIX }}=$updateTagValue
+
+      - shell: bash
+        if: needs.detect-infrachanges.outputs.infraHasChanges == 'true'
+        run: |
+          az deployment group wait --created -n ${{ env.STACK_SUFFIX }}-${{github.run_number}}-${{github.run_attempt}} -g ${{ vars.AZURE_RG_NAME }}
+
+      - name: 'Get frontdoor API Service URL'
+        id: frontdoor
+        shell: bash
+        run: |
+          fdname=$(az afd profile list -g ${{ vars.AZURE_RG_NAME }} --query "[?contains(name, 'afd')].name" --output tsv)
+          echo $fdname
+          serviceurl=https://$(az afd endpoint list --profile-name $fdname -g ${{ vars.AZURE_RG_NAME }} --query "[?contains(name, 'api')].hostName" --output tsv)
+          echo "serviceurl=$(echo $serviceurl)" >> $GITHUB_OUTPUT
+
+      - name: 'Get Function App name'
+        id: funcapp
+        shell: bash
+        run: |
+          functionAppName=$(az functionapp list --resource-group ${{ vars.AZURE_RG_NAME }} --query "[?contains(name, 'tmp${{github.event.number}}')].name" --output tsv)
+          echo "functionAppName=$(echo $functionAppName)" >> $GITHUB_OUTPUT
+
+      - name: 'Get Diagnostics Storage account name'
+        id: diagstorage
+        shell: bash
+        run: |
+          diagStorageAccountName=$(az storage account list -g ${{ vars.AZURE_RG_NAME }} --query "[?contains(name, 'diag')].name" --output tsv)
+          echo "diagStorageAccountName=$(echo $diagStorageAccountName)" >> $GITHUB_OUTPUT
+
+      - name: logout
+        if: ${{ always() }}
+        run: az logout || true
+
+  deploy-image:
+    permissions:
+      contents: read
+      id-token: write
+    runs-on: ubuntu-latest
+    environment: east_us_2_development
+    needs:
+      - provision-infra
+      - provision-mongodb
+      - provision-kafka
+      - build-image
+      - build-versions-worker-image
+      - build-commit-processor-image
+      - build-stats-processor-image
+      - build-events-processor-image
+      - build-delete-worker-image
+      - tam-registration
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Login to Azure
+        uses: azure/login@v1
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: 'Restart TAM Sidecar container'
+        shell: bash
+        run: |
+          az containerapp update --name ${{ needs.provision-infra.outputs.API_CONTAINER_NAME }} --container-name ${{ needs.provision-infra.outputs.API_TAM_CONTAINER_NAME }} --resource-group ${{ vars.AZURE_RG_NAME }} --revision-suffix restart${{ github.run_number }}-${{ github.run_attempt }} &
+          az containerapp update --name ${{ needs.provision-infra.outputs.COMMIT_CONTAINER_NAME }} --container-name ${{ needs.provision-infra.outputs.COMMIT_TAM_CONTAINER_NAME }} --resource-group ${{ vars.AZURE_RG_NAME }} --revision-suffix restart${{ github.run_number }}-${{ github.run_attempt }}
+
+      - name: 'Update the Container Apps with appropriate images'
+        shell: bash
+        run: |
+          az acr login --name ${{ vars.REGISTRY_NAME_v2 }}
+          az containerapp update --name ${{ needs.provision-infra.outputs.API_CONTAINER_NAME }} --container-name ${{ needs.provision-infra.outputs.API_CONTAINER_NAME }} --resource-group ${{ vars.AZURE_RG_NAME }} --image ${{ vars.REGISTRY_LOGIN_SERVER_v2 }}/${{ needs.build-image.outputs.IMAGE_NAME_TAG }} &
+          az containerapp update --name ${{ needs.provision-infra.outputs.VWORKER_CONTAINER_NAME }} --resource-group ${{ vars.AZURE_RG_NAME }} --image ${{ vars.REGISTRY_LOGIN_SERVER_v2 }}/${{ needs.build-versions-worker-image.outputs.VWORKER_IMAGE_NAME_TAG }} &
+          az containerapp update --name ${{ needs.provision-infra.outputs.STATS_CONTAINER_NAME }} --resource-group ${{ vars.AZURE_RG_NAME }} --image ${{ vars.REGISTRY_LOGIN_SERVER_v2 }}/${{ needs.build-stats-processor-image.outputs.STATS_PROCESSOR_IMAGE_NAME_TAG }} &
+          az containerapp update --name ${{ needs.provision-infra.outputs.COMMIT_CONTAINER_NAME }} --container-name ${{ needs.provision-infra.outputs.COMMIT_CONTAINER_NAME }} --resource-group ${{ vars.AZURE_RG_NAME }} --image  ${{ vars.REGISTRY_LOGIN_SERVER_v2 }}/${{ needs.build-commit-processor-image.outputs.COMMIT_PROCESSOR_IMAGE_NAME_TAG }} &
+          az containerapp update --name ${{ needs.provision-infra.outputs.SPACE_EVENTS_PROCESSOR_CONTAINER_NAME }} --resource-group ${{ vars.AZURE_RG_NAME }} --image  ${{ vars.REGISTRY_LOGIN_SERVER_v2 }}/${{ needs.build-events-processor-image.outputs.EVENTS_PROCESSOR_IMAGE_NAME_TAG }} &
+          az containerapp update --name ${{ needs.provision-infra.outputs.RESOURCE_EVENTS_PROCESSOR_CONTAINER_NAME }} --resource-group ${{ vars.AZURE_RG_NAME }} --image  ${{ vars.REGISTRY_LOGIN_SERVER_v2 }}/${{ needs.build-events-processor-image.outputs.EVENTS_PROCESSOR_IMAGE_NAME_TAG }} &
+          az containerapp update --name ${{ needs.provision-infra.outputs.DELETE_WORKER_CONTAINER_NAME }} --resource-group ${{ vars.AZURE_RG_NAME }} --image  ${{ vars.REGISTRY_LOGIN_SERVER_v2 }}/${{ needs.build-delete-worker-image.outputs.DELETE_WORKER_IMAGE_NAME_TAG }}
+
+      - name: logout
+        if: ${{ always() }}
+        run: az logout || true
+
+  ## Cleanup folder with the test coverage results when we deploy a new version of the code before executing tests
+  cleanup-coverage:
+    permissions:
+      contents: read
+      id-token: write
+    runs-on: ubuntu-20.04 # temp fix for mount issue
+    environment: east_us_2_development
+    needs:
+      - provision-infra
+      - deploy-image
+    steps:
+      - name: Login to Azure
+        uses: azure/login@v1
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: 'Mount SMB folder'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt install -y linux-modules-extra-azure
+          sudo apt-get install -y cifs-utils
+          sudo mkdir -p ${{ env.COVERAGE_MOUNT }}
+          export KEY=$(az storage account keys list --resource-group ${{ vars.AZURE_RG_NAME }} --account-name ${{ needs.provision-infra.outputs.DIAG_STORAGE_ACCOUNT_NAME }} --query "[0].value" | tr -d '"')
+          sudo mount -t cifs //${{ needs.provision-infra.outputs.DIAG_STORAGE_ACCOUNT_NAME }}.file.core.windows.net/coverage ${{ env.COVERAGE_MOUNT }} -o vers=3.0,username=${{ needs.provision-infra.outputs.DIAG_STORAGE_ACCOUNT_NAME }},password=$KEY,dir_mode=0777,file_mode=0777,serverino,nosharesock,actimeo=30
+
+      - name: 'List existing folders'
+        shell: bash
+        run: |
+          ls ${{ env.COVERAGE_MOUNT }}
+
+      - name: Cleanup all coverage reports
+        shell: bash
+        run: |
+          rm -v ${{ env.COVERAGE_MOUNT }}/${{ env.COVERAGE_DIR }}/* || true
+
+      - name: 'Unmount SMB folder'
+        shell: bash
+        run: |
+          sudo umount ${{ env.COVERAGE_MOUNT }} || true
+
+      - name: logout
+        if: ${{ always() }}
+        run: az logout || true
+
+  deploy-function:
+    permissions:
+      contents: read
+      id-token: write
+    runs-on: ubuntu-latest
+    environment: east_us_2_development
+    needs:
+      - provision-infra
+      - provision-mongodb
+      - provision-kafka
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Login to Azure
+        uses: azure/login@v1
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: 'Setup Azure Core Tools'
+        shell: bash
+        run: |
+          wget -q https://packages.microsoft.com/config/ubuntu/22.04/packages-microsoft-prod.deb
+          sudo dpkg -i packages-microsoft-prod.deb
+          sudo apt-get update
+          sudo apt-get install azure-functions-core-tools-4
+          npm install
+
+      # Below bash block is used publish updated function app code to green deployment slot
+      - name: 'Publish Function App'
+        shell: bash
+        run: |
+          pushd './${{ env.AZURE_FUNCTION_APP_PACKAGE_PATH }}'
+          func azure functionapp publish ${{ needs.provision-infra.outputs.FUNCTION_APP_NAME }} --slot green --build remote --node
+          popd
+
+      # Below bash block is used swap the updated code to production deployment slot
+      - name: 'Function App swap slot'
+        shell: bash
+        run: |
+          pushd './${{ env.AZURE_FUNCTION_APP_PACKAGE_PATH }}'
+          az functionapp deployment slot swap --resource-group ${{ vars.AZURE_RG_NAME }} --name ${{ needs.provision-infra.outputs.FUNCTION_APP_NAME }} --slot green --target-slot production
+
+      - name: 'Check Functions availability'
+        shell: bash
+        run: |
+          while [ -z "$(az functionapp function list --name ${{ needs.provision-infra.outputs.FUNCTION_APP_NAME }} --resource-group ${{ vars.AZURE_RG_NAME }} --query '[].name' -o tsv)" ]; do
+          echo "Azure Function App functions are not available. Sleeping for 10 seconds..."
+          sleep 10
+          done
+          echo "Azure Function App functions are now available!"
+
+      - name: logout
+        run: az logout || true
+
+  subscribe-function:
+    permissions:
+      contents: read
+      id-token: write
+    environment: east_us_2_development
+    runs-on: ubuntu-latest
+    needs:
+      - provision-infra
+      - deploy-function
+      - detect-infrachanges
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Login to Azure
+        if: needs.detect-infrachanges.outputs.infraHasChanges == 'true'
+        uses: azure/login@v1
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: 'Subscribe to Azure Functions using Bicep'
+        if: needs.detect-infrachanges.outputs.infraHasChanges == 'true'
+        uses: azure/arm-deploy@v1
+        with:
+          scope: resourcegroup
+          subscriptionId: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          resourceGroupName: ${{ vars.AZURE_RG_NAME }}
+          template: ./iac/bicep/main-subscribe.bicep
+          parameters: 'stackSuffix="${{ env.STACK_SUFFIX }}" contentStorageAccountName="${{ needs.provision-infra.outputs.STORAGE_ACCOUNT_NAME }}" fileActivatorDlBlobName="${{ needs.provision-infra.outputs.FILE_ACTIVATOR_BLOB_CONTAINER_NAME }}" storageSystemTopicName="${{ needs.provision-infra.outputs.STORAGE_SYSTEM_TOPIC_NAME }}" blobContainerName="${{ env.STORAGE_CONTAINER_NAME }}" functionAppName="${{ needs.provision-infra.outputs.FUNCTION_APP_NAME }}"'
+          failOnStdErr: false
+          deploymentName: ${{ env.STACK_SUFFIX }}-subscribe-${{github.run_number}}-${{github.run_attempt}}
+
+      - shell: bash
+        if: needs.detect-infrachanges.outputs.infraHasChanges == 'true'
+        run: |
+          az deployment group wait --created -n ${{ env.STACK_SUFFIX }}-subscribe-${{github.run_number}}-${{github.run_attempt}} -g ${{ vars.AZURE_RG_NAME }}
+
+      - name: logout
+        if: needs.detect-infrachanges.outputs.infraHasChanges == 'true' || ${{ always() }}
+        run: az logout || true
+
+  build-image:
+    permissions:
+      id-token: write
+      contents: read
+      security-events: write
+      actions: read
+    environment: east_us_2_development
+    runs-on: ubuntu-latest-4-cores
+    env:
+      IMAGE_NAME_TAG: tdrive-api-tmp${{github.event.number}}:${{ github.run_number }}.${{ github.run_attempt }}.${{ github.sha }}
+      APP_VERSION: v0.0.0-tmp${{github.event.number}}-${{ github.run_number }}-${{ github.run_attempt }}
+    outputs:
+      APP_VERSION: ${{ env.APP_VERSION }}
+      IMAGE_NAME_TAG: ${{ env.IMAGE_NAME_TAG }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Login to Azure
+        uses: azure/login@v1
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: 'Build and Publish Image'
+        shell: bash
+        run: |
+          az acr login --name ${{ vars.REGISTRY_NAME_v2 }}
+          docker build --target debug -f src/api/Dockerfile -t ${{ vars.REGISTRY_LOGIN_SERVER_v2 }}/${{ env.IMAGE_NAME_TAG }} --build-arg APP_VERSION=${{ env.APP_VERSION }} --build-arg COVERAGE_DIR=${{ env.COVERAGE_DIR }} --build-arg GH_TOKEN=${{ secrets.TAM_SDK_REPO_PAT_TOKEN }} .
+          docker push ${{ vars.REGISTRY_LOGIN_SERVER_v2 }}/${{ env.IMAGE_NAME_TAG }}
+
+      - name: 'Snyk image scan'
+        continue-on-error: true
+        uses: snyk/actions/docker@master
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          image: ${{ vars.REGISTRY_LOGIN_SERVER_v2 }}/${{ env.IMAGE_NAME_TAG }}
+          args: --file=src/api/Dockerfile --severity-threshold=high
+
+      - name: Upload SARIF file
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: snyk.sarif
+          category: snyk-api-image
+
+      - name: logout
+        if: ${{ always() }}
+        run: az logout || true
+
+  build-versions-worker-image:
+    permissions:
+      id-token: write
+      contents: read
+      actions: read
+      security-events: write
+    environment: east_us_2_development
+    runs-on: ubuntu-latest-4-cores
+    env:
+      VWORKER_IMAGE_NAME_TAG: tdrive-vworker-tmp${{github.event.number}}:${{ github.run_number }}.${{ github.run_attempt }}.${{ github.sha }}
+      APP_VERSION: v0.0.0-tmp${{github.event.number}}-${{ github.run_number }}-${{ github.run_attempt }}
+    outputs:
+      APP_VERSION: ${{ env.APP_VERSION }}
+      VWORKER_IMAGE_NAME_TAG: ${{ env.VWORKER_IMAGE_NAME_TAG }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Login to Azure
+        uses: azure/login@v1
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: 'Build and Publish Image'
+        shell: bash
+        run: |
+          az acr login --name ${{ vars.REGISTRY_NAME_v2 }}
+          docker build --target debug -f src/versions-worker/Dockerfile -t ${{ vars.REGISTRY_LOGIN_SERVER_v2 }}/${{ env.VWORKER_IMAGE_NAME_TAG }} --build-arg APP_VERSION=${{ env.APP_VERSION }} --build-arg COVERAGE_DIR=${{ env.COVERAGE_DIR }} --build-arg GH_TOKEN=${{ secrets.TAM_SDK_REPO_PAT_TOKEN }} .
+          docker push ${{ vars.REGISTRY_LOGIN_SERVER_v2 }}/${{ env.VWORKER_IMAGE_NAME_TAG }}
+
+      - name: 'Snyk image scan'
+        continue-on-error: true
+        uses: snyk/actions/docker@master
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          image: ${{ vars.REGISTRY_LOGIN_SERVER_v2 }}/${{ env.VWORKER_IMAGE_NAME_TAG }}
+          args: --file=src/versions-worker/Dockerfile --severity-threshold=high
+
+      - name: Upload SARIF file
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: snyk.sarif
+          category: snyk-vworker-image
+
+      - name: logout
+        if: ${{ always() }}
+        run: az logout || true
+
+  build-commit-processor-image:
+    permissions:
+      id-token: write
+      contents: read
+      actions: read
+      security-events: write
+    environment: east_us_2_development
+    runs-on: ubuntu-latest-4-cores
+    env:
+      COMMIT_PROCESSOR_IMAGE_NAME_TAG: tdrive-commit-tmp${{github.event.number}}:${{ github.run_number }}.${{ github.run_attempt }}.${{ github.sha }}
+      APP_VERSION: v0.0.0-tmp${{github.event.number}}-${{ github.run_number }}-${{ github.run_attempt }}
+    outputs:
+      APP_VERSION: ${{ env.APP_VERSION }}
+      COMMIT_PROCESSOR_IMAGE_NAME_TAG: ${{ env.COMMIT_PROCESSOR_IMAGE_NAME_TAG }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Login to Azure
+        uses: azure/login@v1
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: 'Build and Publish Image'
+        shell: bash
+        run: |
+          az acr login --name ${{ vars.REGISTRY_NAME_v2 }}
+          docker build --target debug -f src/commit-processor/Dockerfile -t ${{ vars.REGISTRY_LOGIN_SERVER_v2 }}/${{ env.COMMIT_PROCESSOR_IMAGE_NAME_TAG }} --build-arg APP_VERSION=${{ env.APP_VERSION }} --build-arg COVERAGE_DIR=${{ env.COVERAGE_DIR }} --build-arg GH_TOKEN=${{ secrets.TAM_SDK_REPO_PAT_TOKEN }} .
+          docker push ${{ vars.REGISTRY_LOGIN_SERVER_v2 }}/${{ env.COMMIT_PROCESSOR_IMAGE_NAME_TAG }}
+
+      - name: 'Snyk image scan'
+        continue-on-error: true
+        uses: snyk/actions/docker@master
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          image: ${{ vars.REGISTRY_LOGIN_SERVER_v2 }}/${{ env.COMMIT_PROCESSOR_IMAGE_NAME_TAG }}
+          args: --file=src/commit-processor/Dockerfile --severity-threshold=high
+
+      - name: Upload SARIF file
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: snyk.sarif
+          category: snyk-commitprocessor-image
+
+      - name: logout
+        if: ${{ always() }}
+        run: az logout || true
+
+  build-stats-processor-image:
+    permissions:
+      id-token: write
+      contents: read
+      actions: read
+      security-events: write
+    environment: east_us_2_development
+    runs-on: ubuntu-latest-4-cores
+    env:
+      STATS_PROCESSOR_IMAGE_NAME_TAG: tdrive-stats-tmp${{github.event.number}}:${{ github.run_number }}.${{ github.run_attempt }}.${{ github.sha }}
+      APP_VERSION: v0.0.0-tmp${{github.event.number}}-${{ github.run_number }}-${{ github.run_attempt }}
+    outputs:
+      APP_VERSION: ${{ env.APP_VERSION }}
+      STATS_PROCESSOR_IMAGE_NAME_TAG: ${{ env.STATS_PROCESSOR_IMAGE_NAME_TAG }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Login to Azure
+        uses: azure/login@v1
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: 'Build and Publish Image'
+        shell: bash
+        run: |
+          az acr login --name ${{ vars.REGISTRY_NAME_v2 }}
+          docker build --target debug -f src/stats-processor/Dockerfile -t ${{ vars.REGISTRY_LOGIN_SERVER_v2 }}/${{ env.STATS_PROCESSOR_IMAGE_NAME_TAG }} --build-arg APP_VERSION=${{ env.APP_VERSION }} --build-arg COVERAGE_DIR=${{ env.COVERAGE_DIR }} --build-arg GH_TOKEN=${{ secrets.TAM_SDK_REPO_PAT_TOKEN }} .
+          docker push ${{ vars.REGISTRY_LOGIN_SERVER_v2 }}/${{ env.STATS_PROCESSOR_IMAGE_NAME_TAG }}
+
+      - name: 'Snyk image scan'
+        continue-on-error: true
+        uses: snyk/actions/docker@master
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          image: ${{ vars.REGISTRY_LOGIN_SERVER_v2 }}/${{ env.STATS_PROCESSOR_IMAGE_NAME_TAG }}
+          args: --file=src/stats-processor/Dockerfile --severity-threshold=high
+
+      - name: Upload SARIF file
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: snyk.sarif
+          category: snyk-statsprocessor-image
+
+      - name: logout
+        if: ${{ always() }}
+        run: az logout || true
+
+  build-delete-worker-image:
+    permissions:
+      id-token: write
+      contents: read
+      actions: read
+      security-events: write
+    environment: east_us_2_development
+    runs-on: ubuntu-latest-4-cores
+    env:
+      DELETE_WORKER_IMAGE_NAME_TAG: tdrive-delworker-tmp${{github.event.number}}:${{ github.run_number }}.${{ github.run_attempt }}.${{ github.sha }}
+      APP_VERSION: v0.0.0-tmp${{github.event.number}}-${{ github.run_number }}-${{ github.run_attempt }}
+    outputs:
+      APP_VERSION: ${{ env.APP_VERSION }}
+      DELETE_WORKER_IMAGE_NAME_TAG: ${{ env.DELETE_WORKER_IMAGE_NAME_TAG }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Login to Azure
+        uses: azure/login@v1
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: 'Build and Publish Image'
+        shell: bash
+        run: |
+          az acr login --name ${{ vars.REGISTRY_NAME_v2 }}
+          docker build --target debug -f src/delete-worker/Dockerfile -t ${{ vars.REGISTRY_LOGIN_SERVER_v2 }}/${{ env.DELETE_WORKER_IMAGE_NAME_TAG }} --build-arg APP_VERSION=${{ env.APP_VERSION }} --build-arg COVERAGE_DIR=${{ env.COVERAGE_DIR }} --build-arg GH_TOKEN=${{ secrets.TAM_SDK_REPO_PAT_TOKEN }}  .
+          docker push ${{ vars.REGISTRY_LOGIN_SERVER_v2 }}/${{ env.DELETE_WORKER_IMAGE_NAME_TAG }}
+
+      - name: 'Snyk image scan'
+        continue-on-error: true
+        uses: snyk/actions/docker@master
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          image: ${{ vars.REGISTRY_LOGIN_SERVER_v2 }}/${{ env.DELETE_WORKER_IMAGE_NAME_TAG }}
+          args: --file=src/delete-worker/Dockerfile --severity-threshold=high
+
+      - name: Upload SARIF file
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: snyk.sarif
+          category: snyk-delworker-image
+
+      - name: logout
+        if: ${{ always() }}
+        run: az logout || true
+
+  build-events-processor-image:
+    permissions:
+      id-token: write
+      contents: read
+      actions: read
+      security-events: write
+    environment: east_us_2_development
+    runs-on: ubuntu-latest-4-cores
+    env:
+      EVENTS_PROCESSOR_IMAGE_NAME_TAG: tdrive-event-tmp${{github.event.number}}:${{ github.run_number }}.${{ github.run_attempt }}.${{ github.sha }}
+      APP_VERSION: v0.0.0-tmp${{github.event.number}}-${{ github.run_number }}-${{ github.run_attempt }}
+    outputs:
+      APP_VERSION: ${{ env.APP_VERSION }}
+      EVENTS_PROCESSOR_IMAGE_NAME_TAG: ${{ env.EVENTS_PROCESSOR_IMAGE_NAME_TAG }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Login to Azure
+        uses: azure/login@v1
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: 'Build and Publish Image'
+        shell: bash
+        run: |
+          az acr login --name ${{ vars.REGISTRY_NAME_v2 }}
+          docker build --target debug -f src/events-processor/Dockerfile -t ${{ vars.REGISTRY_LOGIN_SERVER_v2 }}/${{ env.EVENTS_PROCESSOR_IMAGE_NAME_TAG }} --build-arg APP_VERSION=${{ env.APP_VERSION }} --build-arg COVERAGE_DIR=${{ env.COVERAGE_DIR }} --build-arg GH_TOKEN=${{ secrets.TAM_SDK_REPO_PAT_TOKEN }} .
+          docker push ${{ vars.REGISTRY_LOGIN_SERVER_v2 }}/${{ env.EVENTS_PROCESSOR_IMAGE_NAME_TAG }}
+
+      - name: 'Snyk image scan'
+        continue-on-error: true
+        uses: snyk/actions/docker@master
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          image: ${{ vars.REGISTRY_LOGIN_SERVER_v2 }}/${{ env.EVENTS_PROCESSOR_IMAGE_NAME_TAG }}
+          args: --file=src/events-processor/Dockerfile --severity-threshold=high
+
+      - name: Upload SARIF file
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: snyk.sarif
+          category: snyk-eprocessor-image
+
+      - name: logout
+        if: ${{ always() }}
+        run: az logout || true
+
+  wait-version:
+    runs-on: ubuntu-latest
+    needs:
+      - provision-infra
+      - deploy-image
+      - build-image
+    steps:
+
+      - name: 'Live probe'
+        shell: bash
+        run: |
+          end=$((SECONDS+600))  # wait max 10 minutes
+          while [ $SECONDS -lt $end ] ; do
+            VERSION=$(curl -s -H 'Accept: application/json' "${{ needs.provision-infra.outputs.api_fqdn }}/v1/app/health" | jq -r '.component.version' || echo "unknown")
+            echo "Version: $VERSION =? ${{ needs.build-image.outputs.APP_VERSION }}-debug"
+            [[ "${{ needs.build-image.outputs.APP_VERSION }}-debug" != "$VERSION" ]] || exit 0
+            sleep 1
+          done
+          exit 1
+
+  terraform-deployment-dev-us:
+    runs-on: ubuntu-latest
+    needs:
+      - subscribe-function
+    permissions:
+      id-token: write
+      contents: read
+    environment: east_us_2_development
+    steps:
+      - uses: actions/checkout@v4
+      - name: Terraform NewRelic Plan and Apply
+        uses: ./.github/actions/terraform
+        env:
+          ARM_CLIENT_ID: ${{secrets.AZURE_CLIENT_ID}}
+          ARM_USE_OIDC: True
+          ARM_SUBSCRIPTION_ID: ${{vars.AZURE_SUBSCRIPTION_ID}}
+          ARM_TENANT_ID: ${{vars.AZURE_TENANT_ID}}
+        with:
+          WORKING_DIRECTORY: "iac/monitoring/dev-dcaz/newrelic"
+          TF_VARS_PATH: "./tfvars/dev-dcaz.tfvars"
+          NR_USER_KEY: ${{ secrets.NR_USER_KEY }}
+          MONITORING_TOOL: newrelic
+          TERRAFORM_APPLY: true
+      - name: Terraform Datadog Plan and Apply
+        uses: ./.github/actions/terraform
+        env:
+          ARM_CLIENT_ID: ${{secrets.AZURE_CLIENT_ID}}
+          ARM_USE_OIDC: True
+          ARM_SUBSCRIPTION_ID: ${{vars.AZURE_SUBSCRIPTION_ID}}
+          ARM_TENANT_ID: ${{vars.AZURE_TENANT_ID}}
+        with:
+          WORKING_DIRECTORY: "iac/monitoring/dev-dcaz/datadog"
+          TF_VARS_PATH: "./tfvars/dev-dcaz.tfvars"
+          IC_DATADOG_API_KEY: ${{secrets.IC_DATADOG_API_KEY}}
+          IC_DATADOG_APP_KEY: ${{secrets.IC_DATADOG_APP_KEY}}
+          MONITORING_TOOL: datadog
+          TERRAFORM_APPLY: true
+
+  postman-test:
+    name: "Func Tests"
+    needs:
+      - provision-infra
+      - deploy-image
+      - subscribe-function
+      - cleanup-coverage
+      - wait-version
+    permissions:
+      id-token: write
+      contents: read
+      checks: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: newman-config
+        uses: ./.github/actions/newman-config
+        with:
+          user1_name: "tdrive-user1@trimbleautomation.com"
+          user1_pw: ${{ secrets.TEST_AUTOMATION_USER1_PW_PROD }}
+          user2_name: "tdrive-user2@trimbleautomation.com"
+          user2_pw: ${{ secrets.TEST_AUTOMATION_USER2_PW_PROD }}
+          app_key: ${{ vars.TEST_AUTOMATION_APP_CONSUMER_KEY_PROD }}
+          app_name: ${{ vars.TEST_AUTOMATION_APP_NAME }}
+          app_secret: ${{ secrets.TEST_AUTOMATION_APP_CONSUMER_SECRET_PROD }}
+          app_callback: ${{ vars.TEST_AUTOMATION_APP_CALLBACK }}
+          tid_env: "prod"
+          service_url: "${{ needs.provision-infra.outputs.api_fqdn }}"
+          postman_env_template: "tests/postman/CI.postman_environment.json"
+          aws-role-to-assume: ${{secrets.INVOKE_TID4_LAMBDA_ROLE_ARN}}
+      - name: Upload postman env artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: postman.postman_environment.json
+          path: ${{steps.newman-config.outputs.artifact-name}}
+          retention-days: 1
+
+      - uses: ./.github/actions/newman-run
+        with:
+          collection: "tests/postman/TrimbleDrive.postman_collection.json"
+          environment: ${{steps.newman-config.outputs.artifact-name}}
+          name: "Func Tests"
+
+  postman-test-long:
+    name: "Func Tests Long Running"
+    needs:
+      - provision-infra
+      - deploy-image
+      - subscribe-function
+      - cleanup-coverage
+      - wait-version
+    permissions:
+      id-token: write
+      contents: read
+      checks: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: newman-config
+        uses: ./.github/actions/newman-config
+        with:
+          user1_name: "tdrive-user1@trimbleautomation.com"
+          user1_pw: ${{ secrets.TEST_AUTOMATION_USER1_PW_PROD }}
+          user2_name: "tdrive-user2@trimbleautomation.com"
+          user2_pw: ${{ secrets.TEST_AUTOMATION_USER2_PW_PROD }}
+          app_key: ${{ vars.TEST_AUTOMATION_APP_CONSUMER_KEY_PROD }}
+          app_name: ${{ vars.TEST_AUTOMATION_APP_NAME }}
+          app_secret: ${{ secrets.TEST_AUTOMATION_APP_CONSUMER_SECRET_PROD }}
+          app_callback: ${{ vars.TEST_AUTOMATION_APP_CALLBACK }}
+          tid_env: "prod"
+          service_url: "${{ needs.provision-infra.outputs.api_fqdn }}"
+          postman_env_template: "tests/postman/CI.postman_environment.json"
+          aws-role-to-assume: ${{secrets.INVOKE_TID4_LAMBDA_ROLE_ARN}}
+      - name: Upload postman env artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: postman-long.postman_environment.json
+          path: ${{steps.newman-config.outputs.artifact-name}}
+          retention-days: 1
+
+      - uses: ./.github/actions/newman-run
+        with:
+          collection: "tests/postman/TrimbleDrive-LongRunning.postman_collection.json"
+          environment: ${{steps.newman-config.outputs.artifact-name}}
+          name: "Func Tests Long Running"
+
+  postman-test-smoke:
+    name: "Func Tests Smoke"
+    needs:
+      - provision-infra
+      - deploy-image
+      - subscribe-function
+      - cleanup-coverage
+      - wait-version
+    permissions:
+      id-token: write
+      contents: read
+      checks: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: newman-config
+        uses: ./.github/actions/newman-config
+        with:
+          user1_name: "tdrive-user1@trimbleautomation.com"
+          user1_pw: ${{ secrets.TEST_AUTOMATION_USER1_PW_PROD }}
+          user2_name: "tdrive-user2@trimbleautomation.com"
+          user2_pw: ${{ secrets.TEST_AUTOMATION_USER2_PW_PROD }}
+          app_key: ${{ vars.TEST_AUTOMATION_APP_CONSUMER_KEY_PROD }}
+          app_name: ${{ vars.TEST_AUTOMATION_APP_NAME }}
+          app_secret: ${{ secrets.TEST_AUTOMATION_APP_CONSUMER_SECRET_PROD }}
+          app_callback: ${{ vars.TEST_AUTOMATION_APP_CALLBACK }}
+          tid_env: "prod"
+          service_url: "${{ needs.provision-infra.outputs.api_fqdn }}"
+          postman_env_template: "tests/postman/CI.postman_environment.json"
+          aws-role-to-assume: ${{secrets.INVOKE_TID4_LAMBDA_ROLE_ARN}}
+      - name: Upload postman env artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: postman-smoke.postman_environment.json
+          path: ${{steps.newman-config.outputs.artifact-name}}
+          retention-days: 1
+
+      - uses: ./.github/actions/newman-run
+        with:
+          collection: "tests/postman/TrimbleDrive-Smoke.postman_collection.json"
+          environment: ${{steps.newman-config.outputs.artifact-name}}
+          name: "Func Tests Smoke"
+
+  stats-recovery-test:
+    name: "Stats Recovery Test"
+    environment: east_us_2_development
+    permissions:
+      id-token: write
+      contents: read
+      checks: write
+    needs:
+      - provision-infra
+      - deploy-image
+      - subscribe-function
+      - cleanup-coverage
+      - wait-version
+    runs-on: ubuntu-latest
+    env:
+      TOPIC: dev.dcaz.drive.db.tdrive-tmp${{github.event.number}}.latest.v1
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4.0.1
+        with:
+          role-to-assume: ${{secrets.INVOKE_TID4_LAMBDA_ROLE_ARN}}
+          role-session-name: GitHubDeployment
+          aws-region: eu-west-1
+      - id: test-user
+        uses: ./.github/actions/acquire-tid-token
+        with:
+          user_name: "tdrive-user1@trimbleautomation.com"
+          user_pwd: ${{ secrets.TEST_AUTOMATION_USER1_PW_PROD }}
+          app_key: ${{ vars.TEST_AUTOMATION_APP_CONSUMER_KEY_PROD }}
+          app_name: ${{ vars.TEST_AUTOMATION_APP_NAME }}
+          app_callback: ${{ vars.TEST_AUTOMATION_APP_CALLBACK }}
+          tid_env: "prod"
+      - name: Install k6
+        shell: bash
+        run: |
+          docker run --rm -u "$(id -u):$(id -g)" -v "${PWD}:/xk6" grafana/xk6 build v0.48.0 --with github.com/LeonAdato/xk6-output-statsd
+      - name: Run recovery script
+        shell: bash
+        run: |
+          ./k6 run --out json=k6-results.json --tag STACK_NAME=Stats-recovery-${{ github.event.number }} --env TC_TOKEN=${{ steps.test-user.outputs.token }} --env BASE_URL=${{ needs.provision-infra.outputs.api_fqdn }} --env CONFLUENT_KAFKA_URL=${{ vars.CONFLUENT_KAFKA_URL }} --env CONFLUENT_KAFKA_CLUSTER_ID=${{ vars.CONFLUENT_KAFKA_CLUSTER_ID }} --env TOPIC=${{ env.TOPIC }} --env CONFLUENT_KAFKA_TOKEN=${{ secrets.CONFLUENT_KAFKA_BASIC_AUTH }} ./tests/k6/statsrecovery.js | tee k6-summary.txt
+
+  collect-test-coverage:
+    needs:
+      - postman-test
+      - postman-test-long
+      - postman-test-smoke
+      - provision-infra
+      - stats-recovery-test
+    permissions:
+      id-token: write
+      contents: read
+    environment: east_us_2_development
+    if: ${{ always() }}
+    runs-on: ubuntu-20.04 # temp fix for mount issue
+    env:
+      COVERAGE_ARTIFACT: code-coverage-report
+    steps:
+      - name: Login to Azure
+        uses: azure/login@v1
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - name: Container revision restart
+        run: |
+          # echo
+          echo "${{ needs.provision-infra.outputs.API_CONTAINER_NAME }}"
+          echo "${{ needs.provision-infra.outputs.VWORKER_CONTAINER_NAME }}"
+          echo "${{ needs.provision-infra.outputs.STATS_CONTAINER_NAME }}"
+          echo "${{ needs.provision-infra.outputs.SPACE_EVENTS_PROCESSOR_CONTAINER_NAME }}"
+          echo "${{ needs.provision-infra.outputs.RESOURCE_EVENTS_PROCESSOR_CONTAINER_NAME }}"
+          echo "${{ needs.provision-infra.outputs.DELETE_WORKER_CONTAINER_NAME }}"
+          echo "${{ needs.provision-infra.outputs.COMMIT_CONTAINER_NAME }}"
+
+          # Retrives containerapp active revision
+          export APICONTAINERREVISION=$(az containerapp show --name ${{ needs.provision-infra.outputs.API_CONTAINER_NAME }} --resource-group ${{ vars.AZURE_RG_NAME }} --query "properties.latestReadyRevisionName" -o tsv)
+          export VWORKERCONTAINERREVISION=$(az containerapp show --name ${{ needs.provision-infra.outputs.VWORKER_CONTAINER_NAME }} --resource-group ${{ vars.AZURE_RG_NAME }} --query "properties.latestReadyRevisionName" -o tsv)
+          export STATSCONTAINERREVISION=$(az containerapp show --name ${{ needs.provision-infra.outputs.STATS_CONTAINER_NAME }} --resource-group ${{ vars.AZURE_RG_NAME }} --query "properties.latestReadyRevisionName" -o tsv)
+          export EVENTSPACECONTAINERREVISION=$(az containerapp show --name ${{ needs.provision-infra.outputs.SPACE_EVENTS_PROCESSOR_CONTAINER_NAME }} --resource-group ${{ vars.AZURE_RG_NAME }} --query "properties.latestReadyRevisionName" -o tsv)
+          export EVENTRESPONSECONTAINERREVISION=$(az containerapp show --name ${{ needs.provision-infra.outputs.RESOURCE_EVENTS_PROCESSOR_CONTAINER_NAME }} --resource-group ${{ vars.AZURE_RG_NAME }} --query "properties.latestReadyRevisionName" -o tsv)
+          export DELETEWORKERCONTAINERREVISION=$(az containerapp show --name ${{ needs.provision-infra.outputs.DELETE_WORKER_CONTAINER_NAME }} --resource-group ${{ vars.AZURE_RG_NAME }} --query "properties.latestReadyRevisionName" -o tsv)
+          export COMMITCONTAINERREVISION=$(az containerapp show --name ${{ needs.provision-infra.outputs.COMMIT_CONTAINER_NAME }} --resource-group ${{ vars.AZURE_RG_NAME }} --query "properties.latestReadyRevisionName" -o tsv)
+
+          # Restarts conatinerapp containers
+          az containerapp revision restart --name ${{ needs.provision-infra.outputs.API_CONTAINER_NAME }} --resource-group ${{ vars.AZURE_RG_NAME }} --revision $APICONTAINERREVISION
+          az containerapp revision restart --name ${{ needs.provision-infra.outputs.VWORKER_CONTAINER_NAME }} --resource-group ${{ vars.AZURE_RG_NAME }} --revision $VWORKERCONTAINERREVISION
+          az containerapp revision restart --name ${{ needs.provision-infra.outputs.STATS_CONTAINER_NAME }} --resource-group ${{ vars.AZURE_RG_NAME }} --revision $STATSCONTAINERREVISION
+          az containerapp revision restart --name ${{ needs.provision-infra.outputs.SPACE_EVENTS_PROCESSOR_CONTAINER_NAME }} --resource-group ${{ vars.AZURE_RG_NAME }} --revision $EVENTSPACECONTAINERREVISION
+          az containerapp revision restart --name ${{ needs.provision-infra.outputs.RESOURCE_EVENTS_PROCESSOR_CONTAINER_NAME }} --resource-group ${{ vars.AZURE_RG_NAME }} --revision $EVENTRESPONSECONTAINERREVISION
+          az containerapp revision restart --name ${{ needs.provision-infra.outputs.DELETE_WORKER_CONTAINER_NAME }} --resource-group ${{ vars.AZURE_RG_NAME }} --revision $DELETEWORKERCONTAINERREVISION
+          az containerapp revision restart --name ${{ needs.provision-infra.outputs.COMMIT_CONTAINER_NAME }} --resource-group ${{ vars.AZURE_RG_NAME }} --revision $COMMITCONTAINERREVISION
+
+      - name: 'Mount SMB folder'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt install -y linux-modules-extra-azure
+          sudo apt-get install -y cifs-utils
+          sudo mkdir -p ${{ env.COVERAGE_MOUNT }}
+          export KEY=$(az storage account keys list --resource-group ${{ vars.AZURE_RG_NAME }} --account-name ${{ needs.provision-infra.outputs.DIAG_STORAGE_ACCOUNT_NAME }} --query "[0].value" | tr -d '"')
+          sudo mount -t cifs //${{ needs.provision-infra.outputs.DIAG_STORAGE_ACCOUNT_NAME }}.file.core.windows.net/coverage ${{ env.COVERAGE_MOUNT }} -o vers=3.0,username=${{ needs.provision-infra.outputs.DIAG_STORAGE_ACCOUNT_NAME }},password=$KEY,dir_mode=0777,file_mode=0777,serverino,nosharesock,actimeo=30
+      - name: 'List existing folders'
+        shell: bash
+        run: |
+          # Bugs which cause the containers to keep restarting can result in the `ls` command running "forever", preventing the workflow from completing.
+          # Therefore we run the `ls` command with a 60 seconds timout and a forced kill after an additional 30 seconds.
+          timeout -k 30 60s ls ${{ env.COVERAGE_MOUNT }}
+          if [ $? -eq 124 ]; then
+              echo "Listing existing folders time out. Possibly caused by restarting containers."
+          fi
+      - name: 'List existing files'
+        shell: bash
+        run: |
+          # Bugs which cause the containers to keep restarting can result in the `ls` command running "forever", preventing the workflow from completing.
+          # Therefore we run the `ls` command with a 60 seconds timout and a forced kill after an additional 30 seconds.
+          timeout -k 30 60s ls ${{ env.COVERAGE_MOUNT }}/${{ env.COVERAGE_DIR }}
+          if [ $? -eq 124 ]; then
+              echo "Listing existing folders time out. Possibly caused by restarting containers."
+          fi
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.COVERAGE_ARTIFACT }}
+          path: ${{ env.COVERAGE_MOUNT }}/${{ env.COVERAGE_DIR }}
+          retention-days: 1
+
+      - name: 'Unmount SMB folder'
+        shell: bash
+        run: |
+          sudo umount ${{ env.COVERAGE_MOUNT }} || true
+
+      - name: logout
+        if: ${{ always() }}
+        run: az logout || true
+
+  sonarqube:
+    runs-on: ubuntu-latest
+    env:
+      COVERAGE_ARTIFACT: code-coverage-report
+    needs:
+      - collect-test-coverage
+    environment:
+      name: "SonarQube"
+      url: https://sonar.trimble.tools/dashboard?id=TrimbleConnect.ConnectedDataEnvironment%3ATrimbleDrive
+    if: ${{ always() }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # needed to get the blame information for Sonar
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: 'src/api/go.mod'
+          check-latest: true
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.COVERAGE_ARTIFACT }}
+          path: ${{ env.COVERAGE_ARTIFACT }}
+
+      - name: Output coverage report
+        run: |
+          go tool covdata percent -i=${{ env.COVERAGE_ARTIFACT }} >> $GITHUB_STEP_SUMMARY
+      - name: Convert to format expected by Sonar
+        run: |
+          go tool covdata textfmt -i=${{ env.COVERAGE_ARTIFACT }} -o ${{ env.COVERAGE_ARTIFACT }}.out
+          sed -i -e 's/^trimble.com\/tdrive/src/' ${{ env.COVERAGE_ARTIFACT }}.out
+          sed -i -e 's/^trimble.com\/common/src\/common-go/' ${{ env.COVERAGE_ARTIFACT }}.out
+          cat ${{ env.COVERAGE_ARTIFACT }}.out
+      - name: Analyze PR branch
+        uses: sonarsource/sonarqube-scan-action@master
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: https://sonar.trimble.tools/
+        with:
+          args: >
+            -Dsonar.pullrequest.base=main
+            -Dsonar.pullrequest.key=${{github.event.number}}
+            -Dsonar.pullrequest.branch=${{ github.head_ref || github.ref_name }}
+            -Dsonar.go.coverage.reportPaths=${{ env.COVERAGE_ARTIFACT }}.out
+      # If you wish to fail your job when the Quality Gate is red, uncomment the
+      # following lines. This would typically be used to fail a deployment.
+      # We do not recommend to use this in a pull request. Prefer using pull request
+      # decoration instead.
+      # - uses: sonarsource/sonarqube-quality-gate-action@master
+      #   if: github.event_name == 'pull_request'
+      #   timeout-minutes: 5
+      #   env:
+      #     SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}

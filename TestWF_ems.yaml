@@ -1,0 +1,287 @@
+name: ems-v4_1-stack
+run-name: ${{ github.actor }} ems-v4_1-${{ github.event.inputs.environment_name }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment_name:
+        description: 'enter the environment'
+        required: true
+      commit_id:
+        description: 'enter the github commit id'
+      profile_db_update:
+        type: boolean
+      tag_version:
+        description: 'enter the tag version'
+
+permissions:
+  id-token: write
+  contents: write
+
+env:
+  validStgProdDeployUsers: 'ssubram5,Bharathr1,mohammed-abbas06,Mohamed-Kalandar-Sulaiman-S'
+  AZURE_FUNCTIONAPP_PACKAGE_PATH: 'ReadAPIs'       # set this to the path to your function app project, defaults to the repository root
+  NODE_VERSION: '18.0'                   # set this to the node version to use, defaults to the latest LTS version
+  
+jobs: 
+  checks_user_permissions_and_assign_env:
+    runs-on: ubuntu-latest
+    outputs:
+      env_value: ${{ steps.set_env.outputs.github_env }}
+      terraform_tfvar: ${{ steps.set_env.outputs.terraform_tfvar }}
+      terraform_state_file: ${{ steps.set_env.outputs.terraform_state_file }}
+      terraform_storage_rg: ${{ steps.set_env.outputs.terraform_storage_rg }}
+      terraform_storage_name: ${{ steps.set_env.outputs.terraform_storage_name }}
+      
+    steps:
+    - name: Check if the user has permission to deploy
+      if: ${{ (github.event.inputs.environment_name == 'prod' || github.event.inputs.environment_name == 'stg') && !(contains(env.validStgProdDeployUsers, github.actor)) }}
+      run: |
+        echo "the user does not have permission"
+        exit 1
+
+    - name: Set Environment
+      id: set_env
+      run: |
+        if echo "${{ github.event.inputs.environment_name }}" | grep -Eq '^dev[1-9]$'; then
+          echo "env=dev"
+          github_env="dev"
+          terraform_tfvar="${{github.event.inputs.environment_name}}.tfvars"
+          terraform_state_file="ems4.1${{github.event.inputs.environment_name}}.tfstate"
+          terraform_storage_rg="ems-tlv4-rg-dev"
+          terraform_storage_name="emsterraformstate"
+        else
+          echo "env=${{ github.event.inputs.environment_name }}"
+          github_env=${{ github.event.inputs.environment_name }}
+          terraform_tfvar="${{github.event.inputs.environment_name}}.tfvars"
+          terraform_state_file="${{github.event.inputs.environment_name}}.tfstate"
+        fi
+        if [[ "${{github.event.inputs.environment_name}}" == dev* ]] || [ "${{github.event.inputs.environment_name}}" == "qa" ]; then
+           terraform_storage_rg="ems-tlv4-rg-dev"
+           terraform_storage_name="emsterraformstate"
+        elif [ "${{github.event.inputs.environment_name}}" == "stg" ] || [ "${{github.event.inputs.environment_name}}" == "pt" ]; then
+            terraform_storage_rg="corp-bsys-rg-int"
+            terraform_storage_name="bsysterraformstateint"
+        elif [ "${{github.event.inputs.environment_name}}" == "prod" ]; then
+            terraform_storage_rg="corp-bsys-rg-prod"
+            terraform_storage_name="bsysterraformstateprod"
+        else
+            echo "pass right environment value dev1-9 or qa or stg or pt or prod"
+            exit 1
+        fi
+        echo "github_env=$github_env" >> $GITHUB_OUTPUT
+        echo "terraform_tfvar=$terraform_tfvar" >> $GITHUB_OUTPUT
+        echo "terraform_state_file=$terraform_state_file" >> $GITHUB_OUTPUT
+        echo "terraform_storage_rg=$terraform_storage_rg" >> $GITHUB_OUTPUT
+        echo "terraform_storage_name=$terraform_storage_name" >> $GITHUB_OUTPUT
+
+  azure_infra_deploy:
+    needs: checks_user_permissions_and_assign_env
+    runs-on: ubuntu-latest
+    environment: ${{ needs.checks_user_permissions_and_assign_env.outputs.env_value}}
+    permissions:
+      id-token: write
+      contents: write
+    outputs:
+      gl_function_name: ${{ steps.azure_infra_details.outputs.gl_function_name }}
+      ge_function_name: ${{ steps.azure_infra_details.outputs.ge_function_name }}
+      rg_name: ${{ steps.azure_infra_details.outputs.rg_name }}
+
+    steps:
+      - name: Git clone the repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.commit_id }}
+
+      - name: Authenticate with Enterprise GitHub Repo
+        env:
+          GITHUB_TOKEN: ${{ secrets.TOKEN_GITHUB }}
+          GITHUB_ACTOR: ${{ vars.USER_GITHUB }}
+        run: |
+          echo "machine github.com login $GITHUB_ACTOR password $GITHUB_TOKEN" > ~/.netrc
+          git config --global url."https://github.com/".insteadOf "git://github.com/"
+          git config --global advice.detachedHead false
+          
+      - name: login to az
+        uses: azure/login@v1
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}   
+      - name: Terraform Init
+        env:
+          ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          ARM_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+        working-directory: ./iac/ems4.1
+        run: terraform init --reconfigure  --backend-config="key=${{needs.checks_user_permissions_and_assign_env.outputs.terraform_state_file}}" --backend-config="resource_group_name=${{needs.checks_user_permissions_and_assign_env.outputs.terraform_storage_rg}}" --backend-config="storage_account_name=${{needs.checks_user_permissions_and_assign_env.outputs.terraform_storage_name}}"
+
+      - name: Terraform Plan
+        env:
+          ARM_CLIENT_ID : ${{ secrets.AZURE_CLIENT_ID }}
+          ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          ARM_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+        working-directory: ./iac/ems4.1
+        run: |
+          terraform plan -out=tfplan '-var-file=${{needs.checks_user_permissions_and_assign_env.outputs.terraform_tfvar}}'
+
+      - name: Terraform Apply
+        id: terraform_apply
+        env:
+          ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          ARM_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+        working-directory: ./iac/ems4.1
+        run: |
+          terraform apply -auto-approve '-var-file=${{needs.checks_user_permissions_and_assign_env.outputs.terraform_tfvar}}' 
+          echo "rg_name=$(terraform output rg_name)" >> $GITHUB_OUTPUT
+          echo "gl_function_app_name=$(terraform output gl_function_app_name)" >> $GITHUB_OUTPUT
+          echo "ge_function_app_name=$(terraform output ge_function_app_name)" >> $GITHUB_OUTPUT
+
+      - name: azure infra details
+        id: azure_infra_details
+        run: |
+          echo "Azure Infra Deployment Completed"
+          echo "gl_function_name=${{steps.terraform_apply.outputs.gl_function_app_name}}" >> $GITHUB_OUTPUT
+          echo "ge_function_name=${{steps.terraform_apply.outputs.ge_function_app_name}}" >> $GITHUB_OUTPUT
+          echo "rg_name=${{steps.terraform_apply.outputs.rg_name}}" >> $GITHUB_OUTPUT
+      - name: logout
+        if: ${{ always() }}
+        run: az logout || true
+
+  function_app_deploy:
+    runs-on: ubuntu-latest
+    needs:
+      - checks_user_permissions_and_assign_env
+      - azure_infra_deploy
+    environment: ${{ needs.checks_user_permissions_and_assign_env.outputs.env_value}}
+    permissions:
+      id-token: write
+      contents: write
+    steps:
+      - uses: actions/checkout@v2
+
+      - name: Setup Node.js environment
+        uses: actions/setup-node@v2
+        with:
+          node-version: 14
+  
+      - name: Install dependencies
+        working-directory: './${{ env.AZURE_FUNCTIONAPP_PACKAGE_PATH }}'
+        run: |
+          npm install -g typescript
+          npm install
+          npm run build
+          cd ../EntitlementReadApis
+          npm install -g typescript
+          npm install
+          npm run build
+  
+      - name: Install Azure Functions Core Tools
+        run: |
+          wget -q https://packages.microsoft.com/config/ubuntu/22.04/packages-microsoft-prod.deb
+          sudo dpkg -i packages-microsoft-prod.deb
+          sudo apt-get update
+          sudo apt-get install azure-functions-core-tools-4
+  
+      - name: Login via Azure CLI
+        uses: azure/login@v1
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+  
+      - name: Deploy to Azure Function App
+        working-directory: './${{ env.AZURE_FUNCTIONAPP_PACKAGE_PATH }}'
+        run: |
+          func azure functionapp publish ${{needs.azure_infra_deploy.outputs.gl_function_name}} --node --force --build local
+          cd ../EntitlementReadApis
+          pwd
+          func azure functionapp publish ${{needs.azure_infra_deploy.outputs.ge_function_name}} --node --force --build local
+  
+      - name: Logout of Azure CLI
+        run: |
+          az logout
+
+
+  sam_deployment:
+    needs: 
+      - checks_user_permissions_and_assign_env
+      - azure_infra_deploy
+    runs-on: ubuntu-latest
+    environment: ${{ needs.checks_user_permissions_and_assign_env.outputs.env_value}}
+
+    steps:
+      - name: Git clone the repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.commit_id }}
+      - name: Install Python 3.8 
+        uses: actions/setup-python@v3
+        with:
+            python-version: 3.8
+
+      - name: SAM Setup 
+        uses: aws-actions/setup-sam@v2
+        with:
+          use-installer: true
+        
+      - name: Install Docker
+        uses: docker/setup-buildx-action@v3
+
+      - name: configure aws credentials
+        uses: aws-actions/configure-aws-credentials@v1.7.0
+        with:
+          role-to-assume : ${{vars.IAM_ROLE}} #change to reflect your IAM role’s ARN
+          role-session-name : GitHub_to_EMSv3AWS_via_FederatedOIDC
+          aws-region: ${{vars.AWS_REGION}}
+
+      - name: Install dependencies
+        working-directory: ./lambdas/libs/python
+        run: |
+          docker build -t py-package .
+          docker run -d py-package sleep 300
+          CONTAINER_ID=$(docker ps -qf "ancestor=py-package")
+          docker cp $CONTAINER_ID:/usr/local/lib/python3.8/site-packages/ .
+          docker cp $CONTAINER_ID:/usr/local/lib64/python3.8/site-packages/ .
+          mv site-packages/* .
+      - name: login to az
+        uses: azure/login@v1
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}  
+
+      - name: SAM template deployment
+        working-directory: .
+        run: |
+          commitdate=$(date -d @$(git log -n1 --format='%at') +"%Y:%m:%d-%H:%M:%S" | tr -d '\n')
+          commitId=$(git rev-list --max-count=1 --abbrev-commit --skip=# HEAD | tr -d '\n')
+          buildDateTime=$(date +"%Y:%m:%d-%H:%M:%S")
+          echo "commitId=$commitId" >> $GITHUB_ENV
+          gl_function_key=$(az functionapp keys list -g ${{needs.azure_infra_deploy.outputs.rg_name}} -n ${{needs.azure_infra_deploy.outputs.gl_function_name}} | jq -r .functionKeys.default)
+          gl_function_endpoint=https://${{needs.azure_infra_deploy.outputs.gl_function_name}}.azurewebsites.net
+          ge_function_key=$(az functionapp keys list -g ${{needs.azure_infra_deploy.outputs.rg_name}} -n ${{needs.azure_infra_deploy.outputs.ge_function_name}} | jq -r .functionKeys.default)
+          ge_function_endpoint=https://${{needs.azure_infra_deploy.outputs.ge_function_name}}.azurewebsites.net
+          pip3.8 install -r lambdas/libs/python/requirements.txt -t lambdas/libs/python/
+          change_params=`echo $(jq -r 'to_entries[] | "\(.key)=\"\(.value)\""' variables/${{ github.event.inputs.environment_name }}.json)`
+          sam deploy --template template.yml --no-fail-on-empty-changeset --stack-name ems-${{ github.event.inputs.environment_name }}-v4-1 --capabilities CAPABILITY_AUTO_EXPAND --parameter-overrides "$(echo $change_params) functionAppEndpoint=$gl_function_endpoint functionAppKey=$gl_function_key geFunctionAppEndpoint=$ge_function_endpoint geFunctionAppKey=$ge_function_key" --s3-bucket ${{vars.S3_BUCKET}}
+      
+      - name: Profile table role update
+        if: ${{ github.event.inputs.profile_db_update == 'true' }}
+        working-directory: .
+        run: |
+          bash dynamodb_check.sh "ems_role_policy_${{ github.event.inputs.environment_name }}-v4-1" "${{vars.AWS_REGION}}"
+
+      - name: Add tag after successful deployment in stage and prod
+        if: ${{ (github.event.inputs.environment_name == 'stg') || (github.event.inputs.environment_name == 'uat') || (github.event.inputs.environment_name == 'prod') }}
+        run: |
+          git tag "${{ github.event.inputs.environment_name }}_${{ github.event.inputs.tag_version }}" $commitId
+          git push origin "${{ github.event.inputs.environment_name }}_${{ github.event.inputs.tag_version }}" --tags
+
+      - name: az logout
+        if: ${{ always() }}
+        run: az logout || true
