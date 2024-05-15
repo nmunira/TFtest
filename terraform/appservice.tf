@@ -7,6 +7,14 @@ terraform {
   }
 }
 
+terraform {
+  backend "azurerm" {
+    resource_group_name   = "TestNaren-RG"
+    storage_account_name  = "sqlwitnessserver1"
+    container_name        = "terraform"
+    key                   = "terraform.tfstate"
+  }
+}
 provider "azurerm" {
   features {}
   # Configuration options
